@@ -246,8 +246,148 @@ Al usar la autenticación por contraseña, estará expuesto a ataques de fuerza 
 > [\!TIP]
 > **Un truco extra:** Si quieres ver "en vivo" cuando alguien intenta entrar y Fail2Ban lo bloquea, puedes usar este comando para leer los logs en tiempo real: tail -f /var/log/fail2ban.log
 
+
+
+
+
+
+
+
+
+
+
 ## Firewall
 
+Al estar usando los servidores como nodos de kubernetes, para el uso del firewall se debe aplicar el principio de "Capas de Seguridad" (Defense in Depth):
+
+1. **Capa 1 (UFW en el Host):** Protege al **Servidor Linux** (El sistema operativo). Aquí decides quién puede administrar la máquina (SSH).
+2. **Capa 2 (NetworkPolicy en K8s):** Protege a **las Aplicaciones** (Tus servicios). Aquí decides quién puede consumir tus servicios (Bacula, Web, DB).
+
+Aquí tienes el diagrama mental de cómo fluye el tráfico y cómo configurarlo paso a paso.
+
+---
+
+### Paso 1: Configurar UFW (Protegiendo el Host)
+
+En UFW, tu objetivo es cerrar todo excepto el SSH y dejar que Kubernetes "respire" (los nodos necesitan hablar entre ellos).
+
+**Análisis de tus Redes**
+*  **Red de PODS (Datos reales):** 10.0.0.0/16 (Subred del CNI Cilium)
+
+*  **Red de SERVICIOS (Dato previo):** 10.43.0.0/16 (Endpoints de RK2).
+
+*  **Red FÍSICA:** 172.16.0.0/12 (Tu IP física es 172.16.9.180).
+
+**Comandos a ejecutar (Ejecutar en TODOS los nodos):**
+
+Debes permitir el tráfico desde la red de Pods y hacia ella, de lo contrario Cilium bloqueará los paquetes cuando crucen de un nodo a otro.
+```bash
+# 1. Permitir tráfico de la RED DE PODS (CRÍTICO: Aquí estaba la diferencia)
+sudo ufw allow from 10.0.0.0/16 to any comment 'Cilium Pods CIDR Real'
+
+# 2. Permitir tráfico de la RED DE SERVICIOS
+sudo ufw allow from 10.43.0.0/16 to any comment 'K8s Services CIDR'
+
+# 3. Permitir tráfico VXLAN de Cilium (Comunicación entre nodos)
+sudo ufw allow 8472/udp comment 'Cilium VXLAN'
+
+# 4. Permitir Salud de Cilium
+sudo ufw allow 4240/tcp comment 'Cilium Health'
+
+# 5. Permitir API de Kubernetes (Solo necesario en Masters, pero seguro en todos)
+sudo ufw allow 6443/tcp comment 'K8s API'
+
+# 6. Permitir registro de nodos RKE2
+sudo ufw allow 9345/tcp comment 'RKE2 Node Registration'
+
+# 7. Recargar para aplicar
+sudo ufw reload
+```
+
+*  **Verificación Final:**
+    Después de aplicar esto, verifica que Cilium no tenga errores de conectividad:
+    ```bash
+    kubectl -n kube-system exec -ti ds/cilium -- cilium status --verbose
+    ```
+    
+**Resultado:** Tu servidor Linux está blindado. Solo entras tú por el 2222.
+
+---
+
+### Paso 2: Configurar NetworkPolicy (Protegiendo Bacula)
+
+Ahora, aunque el tráfico llegue a Kubernetes, vamos a poner un "muro interno" para que **nadie** pueda hablar con el puerto 9101 (Bacula) excepto tú o tus clientes de backup autorizados.
+
+**Requisito previo:**
+Para que esto funcione, tu Kubernetes debe usar un CNI que soporte políticas (como **Calico**, **Cilium**, o **Canal**). Si usas K3s básico con Flannel puro, las políticas se ignoran (avísame si usas K3s).
+
+**El Manifiesto (`bacula-firewall.yaml`):**
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: proteger-bacula
+  namespace: default  # Asegúrate que Bacula esté en este namespace
+spec:
+  # 1. A quién aplico esta regla? (Busca los pods con label app: bacula-dir)
+  podSelector:
+    matchLabels:
+      app: bacula-dir # <--- VERIFICA ESTE LABEL CON 'kubectl get pods --show-labels'
+  
+  # 2. Qué tipo de tráfico controlo?
+  policyTypes:
+  - Ingress
+  
+  # 3. Reglas de entrada (Whitelist)
+  ingress:
+  - from:
+    # A) Permitir acceso desde tu IP de admin (ej. VPN o Casa)
+    - ipBlock:
+        cidr: 192.168.1.50/32
+    
+    # B) Permitir acceso desde los Clientes Bacula (los servidores que respaldas)
+    - ipBlock:
+        cidr: 172.16.9.100/32 # Ejemplo IP de un servidor cliente
+    
+    # C) Permitir tráfico interno del cluster (DNS, Monitorización)
+    - namespaceSelector: {} 
+
+    ports:
+    - protocol: TCP
+      port: 9101
+    - protocol: TCP
+      port: 9097
+
+```
+
+**Aplicar la regla:**
+
+```bash
+kubectl apply -f bacula-firewall.yaml
+
+```
+
+---
+
+### ¿Cómo comprobar que funciona?
+
+Esta es la belleza de separar las capas:
+
+1. **Prueba SSH:** Intenta conectar por SSH al puerto 2222.
+* *Debe funcionar.* (Gracias a UFW).
+
+
+2. **Prueba Bacula (desde IP permitida):** Intenta conectar a la consola de Bacula.
+* *Debe funcionar.* (La NetworkPolicy te deja pasar).
+
+
+3. **Prueba Bacula (desde el celular/otra IP):** Intenta conectar al puerto 9101.
+* *Debe fallar.* (La NetworkPolicy bloquea silenciosamente el paquete, aunque UFW lo haya dejado pasar hasta la puerta del cluster).
+
+
+
+¿Sabes qué distribución de Kubernetes estás usando (K3s, RKE2, MicroK8s)? Esto es vital para confirmar si las *NetworkPolicies* funcionarán o si necesitas instalar un plugin extra.
 
 
 ## IDS (Snort)
